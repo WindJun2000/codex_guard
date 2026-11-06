@@ -1,0 +1,10 @@
+# CPA 源码副本，不属于插件仓库
+/CLIProxyAPI/
+
+# 构建产物
+/codex-guard.so
+*.so
+*.dylib
+
+# Release 打包产物（zip/checksums 上传到 GitHub Release，不入库）
+/dist/

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codex-guard",
+      "name": "Codex Guard",
+      "description": "Codex 账号调度与保护插件：按配额/到期时间调度、错误分类与自动冷却熔断、主动配额刷新。",
+      "author": "WindJun2000",
+      "version": "0.2.0",
+      "repository": "https://github.com/WindJun2000/codex_guard",
+      "homepage": "https://github.com/WindJun2000/codex_guard",
+      "license": "MIT",
+      "tags": ["codex", "quota", "scheduler"]
+    }
+  ]
+}
