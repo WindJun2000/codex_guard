@@ -38,6 +38,24 @@ func errorEnvelope(code, message string) []byte {
 	return raw
 }
 
+// registration is the JSON-safe plugin registration payload. Capability fields
+// must be booleans: the host decodes capabilities into bool flags, so we cannot
+// marshal pluginapi.Capabilities (whose interface fields serialize as objects).
+type registration struct {
+	SchemaVersion uint32                 `json:"schema_version"`
+	Metadata      pluginapi.Metadata     `json:"metadata"`
+	Capabilities  registrationCapability `json:"capabilities"`
+}
+
+type registrationCapability struct {
+	Scheduler                 bool `json:"scheduler"`
+	SchedulerAcrossPriorities bool `json:"scheduler_across_priorities,omitempty"`
+	RequestLifecyclePlugin    bool `json:"request_lifecycle_plugin"`
+	StreamChunkInterceptor    bool `json:"response_stream_interceptor"`
+	UsagePlugin               bool `json:"usage_plugin"`
+	ManagementAPI             bool `json:"management_api"`
+}
+
 // handleMethod routes every host RPC to its handler.
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
@@ -78,14 +96,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 // PluginRegistration returns the plugin declaration sent at register time.
-func PluginRegistration() pluginapi.Plugin {
-	return pluginapi.Plugin{
+func PluginRegistration() registration {
+	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "Codex Guard",
 			Version:          "0.2.0",
-			Author:           "xs1390",
-			GitHubRepository: "https://github.com/xs1390/codex-guard",
+			Author:           "WindJun2000",
+			GitHubRepository: "https://github.com/WindJun2000/codex_guard",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "strategy", Type: pluginapi.ConfigFieldTypeString, Description: "quota_pressure | quota | expiry"},
 				{Name: "provider", Type: pluginapi.ConfigFieldTypeString, Description: "auth provider to schedule"},
@@ -108,18 +126,28 @@ func PluginRegistration() pluginapi.Plugin {
 				{Name: "max_parallel_default", Type: pluginapi.ConfigFieldTypeNumber, Description: "default max concurrent requests per account"},
 				{Name: "in_flight_ttl_seconds", Type: pluginapi.ConfigFieldTypeNumber, Description: "in-flight slot lease TTL seconds"},
 				{Name: "fallback_reject", Type: pluginapi.ConfigFieldTypeBoolean, Description: "reject when all accounts unavailable"},
+				{Name: "history_max_entries", Type: pluginapi.ConfigFieldTypeNumber, Description: "max dispatch history entries retained"},
+				{Name: "eval_enabled", Type: pluginapi.ConfigFieldTypeBoolean, Description: "periodic degradation (candy+fingerprint) checks"},
+				{Name: "eval_interval_minutes", Type: pluginapi.ConfigFieldTypeNumber, Description: "minutes between degradation checks (0 disables)"},
+				{Name: "eval_model", Type: pluginapi.ConfigFieldTypeString, Description: "fallback model for degradation checks"},
+				{Name: "eval_effort", Type: pluginapi.ConfigFieldTypeString, Description: "reasoning effort for degradation checks"},
+				{Name: "eval_skip_abnormal", Type: pluginapi.ConfigFieldTypeBoolean, Description: "skip accounts in cooldown/circuit/overload"},
+				{Name: "eval_skip_high_pressure", Type: pluginapi.ConfigFieldTypeBoolean, Description: "skip accounts with high concurrency"},
+				{Name: "eval_high_pressure_parallel", Type: pluginapi.ConfigFieldTypeNumber, Description: "parallel threshold for high-pressure skip"},
+				{Name: "eval_high_pressure_window_seconds", Type: pluginapi.ConfigFieldTypeNumber, Description: "high-pressure observation window seconds"},
+				{Name: "retry_max_attempts", Type: pluginapi.ConfigFieldTypeNumber, Description: "extra retry attempts for safe transport/server errors"},
+				{Name: "retry_backoff_base_seconds", Type: pluginapi.ConfigFieldTypeNumber, Description: "first retry backoff seconds"},
+				{Name: "retry_backoff_max_seconds", Type: pluginapi.ConfigFieldTypeNumber, Description: "max retry backoff seconds"},
+				{Name: "retry_backoff_jitter", Type: pluginapi.ConfigFieldTypeBoolean, Description: "add jitter to retry backoff"},
 			},
 		},
-		Capabilities: pluginapi.Capabilities{
-			Scheduler: schedulerService{},
-			// UsagePlugin receives per-request usage records with the selected
-			// credential and failure body — the primary error-handling hook.
-			UsagePlugin: usageService{},
-			// RequestLifecyclePlugin receives terminal events per request.
-			RequestLifecyclePlugin: lifecycleService{},
-			// StreamChunkInterceptor lets us read upstream rate-limit headers
-			// carried on stream chunks (read-only observation).
-			StreamChunkInterceptor: streamObserver{},
+		Capabilities: registrationCapability{
+			Scheduler:                 true,
+			SchedulerAcrossPriorities: true,
+			RequestLifecyclePlugin:    true,
+			StreamChunkInterceptor:    true,
+			UsagePlugin:               true,
+			ManagementAPI:             true,
 		},
 	}
 }

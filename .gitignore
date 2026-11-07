@@ -2,6 +2,7 @@
 /CLIProxyAPI/
 
 # 构建产物
+/codex-guard
 /codex-guard.so
 *.so
 *.dylib

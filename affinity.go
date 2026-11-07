@@ -13,8 +13,11 @@ type affinityBinding struct {
 }
 
 var (
-	affinityMu       sync.Mutex
-	affinityBindings = map[string]affinityBinding{}
+	affinityMu            sync.Mutex
+	affinityBindings      = map[string]affinityBinding{}
+	affinitySweepOnce     sync.Once
+	affinitySweepStopOnce sync.Once
+	affinitySweepStop     chan struct{}
 )
 
 func affinityKey(provider, sessionID string) string {
@@ -48,4 +51,51 @@ func affinityForget(provider, sessionID string) {
 	affinityMu.Lock()
 	defer affinityMu.Unlock()
 	delete(affinityBindings, affinityKey(provider, sessionID))
+}
+
+// startAffinitySweeper starts the background cleanup loop once. Lookup already
+// removes expired bindings lazily; the sweeper bounds the map when sessions
+// stop being referenced so it cannot grow without limit.
+func startAffinitySweeper() {
+	affinitySweepOnce.Do(func() {
+		affinitySweepStop = make(chan struct{})
+		go affinitySweepLoop()
+	})
+}
+
+func affinitySweepLoop() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			sweepAffinityBindings()
+		case <-affinitySweepStop:
+			return
+		}
+	}
+}
+
+func sweepAffinityBindings() {
+	cfg := activeConfig()
+	if cfg.SessionAffinityTTLSeconds <= 0 {
+		return
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(cfg.SessionAffinityTTLSeconds) * time.Second)
+	affinityMu.Lock()
+	defer affinityMu.Unlock()
+	for key, b := range affinityBindings {
+		if b.LastSeen.Before(cutoff) {
+			delete(affinityBindings, key)
+		}
+	}
+}
+
+func stopAffinitySweeper() {
+	affinitySweepStopOnce.Do(func() {
+		if affinitySweepStop != nil {
+			close(affinitySweepStop)
+		}
+	})
 }

@@ -111,6 +111,14 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	globalRefresher.stopRefresher()
+	stopAffinitySweeper()
+	stopEvalLoop()
+	stopDispatchLogPersister()
+	stopQuotaPersister()
+	stopEvalHistoryPersister()
+	persistDispatchLogIfDirty()
+	persistQuotaIfDirty()
+	persistEvalHistoryIfDirty()
 	stateMu.Lock()
 	globalAccountStates = map[string]*AccountState{}
 	stateMu.Unlock()

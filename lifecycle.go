@@ -32,12 +32,14 @@ func (usageService) HandleUsage(ctx context.Context, record pluginapi.UsageRecor
 	}
 
 	if !record.Failed {
+		releaseSlot(authID, record.SelectionID)
 		recordSuccess(authID)
 		recordTokenUsage(authID, float64(record.Detail.TotalTokens), time.Now())
 		maybeApplyOverload(authID, time.Now())
 		return
 	}
 
+	releaseSlot(authID, record.SelectionID)
 	c := classifyError(record.Failure.StatusCode, record.Failure.Body)
 	applyFailurePolicy(authID, record.Failure.StatusCode, c)
 }
@@ -48,28 +50,62 @@ func (usageService) HandleUsage(ctx context.Context, record pluginapi.UsageRecor
 func applyFailurePolicy(authID string, statusCode int, c classified) {
 	cfg := activeConfig()
 	switch c.Kind {
+	case ErrorTransport, ErrorRetryableServer:
+		// Pre-HTTP transport failures and idempotent upstream 408/502/503/504
+		// (or 500 with OpenAI's explicit retry hint) are safe for CPA to replay.
+		// They must not cool down, trip the circuit breaker, or count toward
+		// escalation — the account is still healthy. A retry_after of 0 (e.g.
+		// websocket_connection_limit_reached) means replay immediately.
+		logf("info", "usage.handle auth=%s kind=%s status=%d reason=%s retryable=true retry_after=%ds", authID, kindName(c.Kind), statusCode, c.Reason, c.RetryAfterSecs)
+		return
+
+	case ErrorClientFault:
+		// Request-scoped 4xx: replaying identical input cannot succeed, and the
+		// account did nothing wrong, so neither retry nor discipline applies.
+		logf("warn", "usage.handle auth=%s kind=%s status=%d reason=%s retryable=false", authID, kindName(c.Kind), statusCode, c.Reason)
+		return
+
 	case ErrorRateLimit:
 		secs := c.RetryAfterSecs
 		if secs <= 0 {
 			secs = cfg.CooldownDefaultSeconds
 		}
-		applyCooldown(authID, secs)
+		if c.Retryable {
+			// Transient admission 429 (turn_rate_limit_exceeded / at capacity):
+			// quota is NOT exhausted, so pause briefly without feeding the
+			// escalation counter. CPA retries after Retry-After.
+			applyTransientPause(authID, secs, "限流/瞬时停用："+c.Reason)
+		} else {
+			// Real quota/rate exhaustion: escalating cooldown.
+			applyCooldown(authID, secs, "限流/额度耗尽："+c.Reason)
+		}
+
 	case ErrorOverloaded:
+		// Overload is terminal for this attempt and must never be retried:
+		// cool the account down and let CPA fall over to a healthy account.
 		secs := c.RetryAfterSecs
 		if secs <= 0 {
 			secs = cfg.CooldownDefaultSeconds
 		}
-		applyCooldown(authID, secs+cfg.CooldownFixedBonusSeconds)
+		applyCooldown(authID, secs+cfg.CooldownFixedBonusSeconds, "服务端过载："+c.Reason)
+
 	case ErrorAuth:
 		if cfg.AutoDisableOnAuthFailure {
 			disableAccount(authID)
 		} else {
-			applyCooldown(authID, cfg.AuthFailureCooldownSeconds)
+			applyCooldown(authID, cfg.AuthFailureCooldownSeconds, "认证失败："+c.Reason)
 		}
+
 	case ErrorServer, ErrorUnknown:
-		recordFailure(authID)
+		// 500 without a retry hint, or an unrecognized failure: keep the legacy
+		// circuit-breaker accounting.
+		reason := "未知错误：" + c.Reason
+		if c.Kind == ErrorServer {
+			reason = "服务端错误：" + c.Reason
+		}
+		recordFailure(authID, reason)
 	}
-	logf("warn", "usage.handle auth=%s kind=%s status=%d reason=%s", authID, kindName(c.Kind), statusCode, c.Reason)
+	logf("warn", "usage.handle auth=%s kind=%s status=%d reason=%s retryable=%v retry_after=%ds", authID, kindName(c.Kind), statusCode, c.Reason, c.Retryable, c.RetryAfterSecs)
 }
 
 func handleUsageHandle(raw []byte) ([]byte, error) {
@@ -84,9 +120,11 @@ func handleUsageHandle(raw []byte) ([]byte, error) {
 }
 
 // ---------------------------------------------------------------------------
-// request.complete — terminal per-request events. Releases the in-flight slot
-// for every outcome and clears state on success. Failure policy is NOT applied
-// here (usage.handle already owns it).
+// request.complete — terminal per-request events. Slot release is idempotent
+// (delete by selection_id), so releasing here for every outcome is a leak
+// guard for cases where usage.handle never fired (rejected/canceled, or an
+// execution with no usage record). Failure policy is NOT applied here —
+// usage.handle already owns it.
 // ---------------------------------------------------------------------------
 
 type lifecycleService struct{}
@@ -108,8 +146,6 @@ func (lifecycleService) HandleRequestComplete(ctx context.Context, completion pl
 		if authID != "" {
 			recordSuccess(authID)
 		}
-	case pluginapi.RequestCompletionRejected, pluginapi.RequestCompletionCanceled:
-		// Nothing beyond slot release: the request never reached upstream.
 	}
 	return nil
 }
@@ -170,6 +206,12 @@ func kindName(k ErrorKind) string {
 		return "auth"
 	case ErrorServer:
 		return "server"
+	case ErrorTransport:
+		return "transport"
+	case ErrorRetryableServer:
+		return "retryable_server"
+	case ErrorClientFault:
+		return "client_fault"
 	default:
 		return "unknown"
 	}

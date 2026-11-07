@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -23,7 +26,7 @@ type OverloadRule struct {
 type AccountConfig struct {
 	ID            string         `yaml:"id" json:"id"`
 	Enabled       *bool          `yaml:"enabled" json:"enabled"`
-	Role          string         `yaml:"role" json:"role"` // "primary" | "backup"
+	Role          string         `yaml:"role" json:"role"` // "primary" | "backup" | "degraded"
 	Weight        *float64       `yaml:"weight" json:"weight"`
 	MaxParallel   *int           `yaml:"max_parallel" json:"max_parallel"`
 	OverloadRules []OverloadRule `yaml:"overload_rules" json:"overload_rules"`
@@ -64,36 +67,69 @@ type Config struct {
 	FallbackReject     bool `yaml:"fallback_reject" json:"fallback_reject"`
 	InFlightTTLSeconds int  `yaml:"in_flight_ttl_seconds" json:"in_flight_ttl_seconds"`
 
+	HistoryMaxEntries     int `yaml:"history_max_entries" json:"history_max_entries"`
+	EvalHistoryMaxEntries int `yaml:"eval_history_max_entries" json:"eval_history_max_entries"`
+
+	EvalEnabled                   bool   `yaml:"eval_enabled" json:"eval_enabled"`
+	EvalIntervalMinutes           int    `yaml:"eval_interval_minutes" json:"eval_interval_minutes"`
+	EvalModel                     string `yaml:"eval_model" json:"eval_model"`
+	EvalEffort                    string `yaml:"eval_effort" json:"eval_effort"`
+	EvalSkipAbnormal              bool   `yaml:"eval_skip_abnormal" json:"eval_skip_abnormal"`
+	EvalSkipHighPressure          bool   `yaml:"eval_skip_high_pressure" json:"eval_skip_high_pressure"`
+	EvalHighPressureParallel      int    `yaml:"eval_high_pressure_parallel" json:"eval_high_pressure_parallel"`
+	EvalHighPressureWindowSeconds int    `yaml:"eval_high_pressure_window_seconds" json:"eval_high_pressure_window_seconds"`
+	EvalConcurrency               int    `yaml:"eval_concurrency" json:"eval_concurrency"`
+
+	RetryMaxAttempts        int  `yaml:"retry_max_attempts" json:"retry_max_attempts"`
+	RetryBackoffBaseSeconds int  `yaml:"retry_backoff_base_seconds" json:"retry_backoff_base_seconds"`
+	RetryBackoffMaxSeconds  int  `yaml:"retry_backoff_max_seconds" json:"retry_backoff_max_seconds"`
+	RetryBackoffJitter      bool `yaml:"retry_backoff_jitter" json:"retry_backoff_jitter"`
+
 	OverloadRules []OverloadRule  `yaml:"overload_rules" json:"overload_rules"`
 	Accounts      []AccountConfig `yaml:"accounts" json:"accounts"`
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Strategy:                    "quota_pressure",
-		Provider:                    "codex",
-		CooldownDefaultSeconds:      60,
-		CooldownFixedBonusSeconds:   30,
-		MaxCooldownSeconds:          1800,
-		AuthFailureCooldownSeconds:  1800,
-		AutoDisableOnAuthFailure:    false,
-		CircuitFailureThreshold:     5,
-		CircuitOpenDurationSeconds:  1800,
-		EscalationWindowSeconds:     600,
-		EscalationThreshold:         3,
-		EscalationMultiplier:        2.0,
-		QuotaRefreshEnabled:         true,
-		QuotaRefreshIntervalSeconds: 300,
-		QuotaHardFloorPercent:       5,
-		ExpiryPriorityEnabled:       true,
-		ExpiryPriorityHorizonHours:  72,
-		SessionAffinityEnabled:      true,
-		SessionAffinityTTLSeconds:   3600,
-		MaxParallelDefault:          5,
-		FallbackReject:              true,
-		InFlightTTLSeconds:          300,
-		OverloadRules:               []OverloadRule{},
-		Accounts:                    []AccountConfig{},
+		Strategy:                      "quota_pressure",
+		Provider:                      "codex",
+		CooldownDefaultSeconds:        60,
+		CooldownFixedBonusSeconds:     30,
+		MaxCooldownSeconds:            1800,
+		AuthFailureCooldownSeconds:    1800,
+		AutoDisableOnAuthFailure:      false,
+		CircuitFailureThreshold:       5,
+		CircuitOpenDurationSeconds:    1800,
+		EscalationWindowSeconds:       600,
+		EscalationThreshold:           3,
+		EscalationMultiplier:          2.0,
+		QuotaRefreshEnabled:           true,
+		QuotaRefreshIntervalSeconds:   300,
+		QuotaHardFloorPercent:         5,
+		ExpiryPriorityEnabled:         true,
+		ExpiryPriorityHorizonHours:    72,
+		SessionAffinityEnabled:        true,
+		SessionAffinityTTLSeconds:     3600,
+		MaxParallelDefault:            5,
+		FallbackReject:                true,
+		InFlightTTLSeconds:            300,
+		HistoryMaxEntries:             500,
+		EvalHistoryMaxEntries:         500,
+		EvalEnabled:                   true,
+		EvalIntervalMinutes:           30,
+		EvalModel:                     "",
+		EvalEffort:                    "low",
+		EvalSkipAbnormal:              true,
+		EvalSkipHighPressure:          true,
+		EvalHighPressureParallel:      2,
+		EvalHighPressureWindowSeconds: 600,
+		EvalConcurrency:               3,
+		RetryMaxAttempts:              2,
+		RetryBackoffBaseSeconds:       1,
+		RetryBackoffMaxSeconds:        4,
+		RetryBackoffJitter:            true,
+		OverloadRules:                 []OverloadRule{},
+		Accounts:                      []AccountConfig{},
 	}
 }
 
@@ -118,6 +154,47 @@ func accountOverride(cfg Config, authID string) *AccountConfig {
 	return nil
 }
 
+// upsertAccountOverride merges a per-account patch into the active config and
+// stores the result. Only non-nil/non-empty fields in patch are applied, so
+// callers can update a single dimension (role, weight, etc.) without clobbering
+// the rest of the override.
+func upsertAccountOverride(authID string, patch AccountConfig) Config {
+	cfg := activeConfig()
+	idx := -1
+	for i := range cfg.Accounts {
+		if cfg.Accounts[i].ID == authID {
+			idx = i
+			break
+		}
+	}
+	var ac AccountConfig
+	if idx >= 0 {
+		ac = cfg.Accounts[idx]
+	} else {
+		ac = AccountConfig{ID: authID}
+	}
+	if patch.Role != "" {
+		ac.Role = patch.Role
+	}
+	if patch.Weight != nil {
+		ac.Weight = patch.Weight
+	}
+	if patch.MaxParallel != nil {
+		ac.MaxParallel = patch.MaxParallel
+	}
+	if patch.Enabled != nil {
+		ac.Enabled = patch.Enabled
+	}
+	if idx >= 0 {
+		cfg.Accounts[idx] = ac
+	} else {
+		cfg.Accounts = append(cfg.Accounts, ac)
+	}
+	cfg = sanitizeConfig(cfg)
+	currentConfig.Store(cfg)
+	return cfg
+}
+
 func effectiveRole(cfg Config, authID string) string {
 	if a := accountOverride(cfg, authID); a != nil && a.Role != "" {
 		return a.Role
@@ -134,7 +211,9 @@ func effectiveWeight(cfg Config, authID string) float64 {
 
 func effectiveMaxParallel(cfg Config, authID string) int {
 	if a := accountOverride(cfg, authID); a != nil && a.MaxParallel != nil {
-		return *a.MaxParallel
+		if *a.MaxParallel > 0 {
+			return *a.MaxParallel
+		}
 	}
 	return cfg.MaxParallelDefault
 }
@@ -232,9 +311,58 @@ func sanitizeConfig(cfg Config) Config {
 	if cfg.SessionAffinityTTLSeconds <= 0 {
 		cfg.SessionAffinityTTLSeconds = 3600
 	}
+	if cfg.HistoryMaxEntries <= 0 {
+		cfg.HistoryMaxEntries = 500
+	}
+	if cfg.EvalHistoryMaxEntries <= 0 {
+		cfg.EvalHistoryMaxEntries = 500
+	}
+	if cfg.RetryMaxAttempts < 0 {
+		cfg.RetryMaxAttempts = 2
+	}
+	if cfg.RetryBackoffBaseSeconds <= 0 {
+		cfg.RetryBackoffBaseSeconds = 1
+	}
+	if cfg.RetryBackoffMaxSeconds <= 0 {
+		cfg.RetryBackoffMaxSeconds = 4
+	}
+	if cfg.RetryBackoffMaxSeconds < cfg.RetryBackoffBaseSeconds {
+		cfg.RetryBackoffMaxSeconds = cfg.RetryBackoffBaseSeconds
+	}
+	if cfg.QuotaHardFloorPercent < 0 {
+		cfg.QuotaHardFloorPercent = 0
+	}
+	if cfg.QuotaHardFloorPercent > 100 {
+		cfg.QuotaHardFloorPercent = 100
+	}
+	if cfg.CooldownFixedBonusSeconds < 0 {
+		cfg.CooldownFixedBonusSeconds = 0
+	}
+	if cfg.EvalIntervalMinutes < 0 {
+		cfg.EvalIntervalMinutes = 0
+	}
+	if cfg.EvalHighPressureParallel < 1 {
+		cfg.EvalHighPressureParallel = 1
+	}
+	if cfg.EvalHighPressureWindowSeconds <= 0 {
+		cfg.EvalHighPressureWindowSeconds = 600
+	}
+	if cfg.EvalConcurrency < 1 {
+		cfg.EvalConcurrency = 3
+	}
+	if cfg.EvalEffort == "" {
+		cfg.EvalEffort = "low"
+	}
 	for i := range cfg.Accounts {
-		if cfg.Accounts[i].Role == "" {
-			cfg.Accounts[i].Role = "primary"
+		ac := &cfg.Accounts[i]
+		if ac.Weight != nil && *ac.Weight < 0 {
+			*ac.Weight = 0
+		}
+		if ac.MaxParallel != nil && *ac.MaxParallel <= 0 {
+			ac.MaxParallel = nil
+		}
+		if ac.WindowSeconds != nil && *ac.WindowSeconds <= 0 {
+			ac.WindowSeconds = nil
 		}
 	}
 	return cfg
@@ -247,11 +375,150 @@ func configure(raw []byte) error {
 			return err
 		}
 	}
-	cfg, err := decodeConfig(req.ConfigYAML)
+	hostCfg, err := decodeConfig(req.ConfigYAML)
 	if err != nil {
 		return err
 	}
-	currentConfig.Store(cfg)
-	maybeStartRefresher()
+	cfg := hostCfg
+	if persisted, ok := loadPersistedConfig(); ok {
+		cfg = persisted
+		logf("info", "using persisted plugin settings from %s; host config_yaml ignored", pluginStatePath())
+	}
+	applyConfig(cfg)
 	return nil
+}
+
+// applyConfig stores, persists, and activates a fully-decoded config, then
+// starts the long-lived background loops it requires. configure() and the
+// management PUT endpoint share this path so every settings update behaves
+// identically (persistence + refresher + history persister).
+func applyConfig(cfg Config) Config {
+	cfg = sanitizeConfig(cfg)
+	currentConfig.Store(cfg)
+	if err := persistConfig(cfg); err != nil {
+		logf("warn", "persist settings failed: %v", err)
+	}
+	maybeStartRefresher()
+	startAffinitySweeper()
+	startDispatchLogPersister()
+	startQuotaPersister()
+	loadDispatchLog()
+	loadQuotaSnapshots()
+	trimDispatchLogNow()
+	startEvalHistoryPersister()
+	loadEvalHistory()
+	trimEvalHistoryNow()
+	startEvalLoop()
+	loadEvalResults()
+	return cfg
+}
+
+const defaultPluginStatePath = "/CLIProxyAPI/plugins/linux/amd64/codex-guard.state.json"
+
+// pluginStatePath returns the persistent settings file location. The plugin
+// cannot write its config back through the host ABI, so settings survive
+// container restarts by reading/writing a JSON file next to the plugin .so.
+func pluginStatePath() string {
+	if p := strings.TrimSpace(os.Getenv("CODEX_GUARD_STATE_FILE")); p != "" {
+		return p
+	}
+	if dir := persistentPluginDir(); dir != "" {
+		return filepath.Join(dir, "codex-guard.state.json")
+	}
+	if dir := selfPluginDir(); dir != "" && !strings.HasPrefix(dir, "/tmp/") {
+		return filepath.Join(dir, "codex-guard.state.json")
+	}
+	return defaultPluginStatePath
+}
+
+// persistentPluginDir finds the persistent plugins directory (the one the
+// plugin host copies the .so from) by scanning mounts for a "plugins" mount
+// point and looking for a codex-guard shared object under linux/<arch>.
+func persistentPluginDir() string {
+	data, err := os.ReadFile("/proc/self/mounts")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		mountpoint := fields[1]
+		if !strings.Contains(strings.ToLower(mountpoint), "plugin") {
+			continue
+		}
+		for _, arch := range []string{"amd64", "arm64", "386", "arm"} {
+			dir := filepath.Join(mountpoint, "linux", arch)
+			if hasCodexGuardSO(dir) {
+				return dir
+			}
+		}
+	}
+	return ""
+}
+
+// hasCodexGuardSO reports whether dir contains a codex-guard plugin .so file.
+func hasCodexGuardSO(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "codex-guard") && strings.HasSuffix(name, ".so") {
+			return true
+		}
+	}
+	return false
+}
+
+// selfPluginDir locates the directory containing this plugin .so by scanning
+// /proc/self/maps for a codex-guard shared object.
+func selfPluginDir() string {
+	data, err := os.ReadFile("/proc/self/maps")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		path := fields[len(fields)-1]
+		if strings.Contains(path, "codex-guard") && strings.HasSuffix(path, ".so") {
+			return filepath.Dir(path)
+		}
+	}
+	return ""
+}
+
+func loadPersistedConfig() (Config, bool) {
+	path := pluginStatePath()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, false
+	}
+	cfg, err := decodeConfig(raw)
+	if err != nil {
+		logf("warn", "persisted config %s invalid: %v", path, err)
+		return Config{}, false
+	}
+	return cfg, true
+}
+
+func persistConfig(cfg Config) error {
+	path := pluginStatePath()
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }

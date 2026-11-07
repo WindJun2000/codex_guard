@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -53,13 +55,14 @@ func maybeApplyOverload(authID string, now time.Time) {
 	if len(rules) == 0 {
 		return
 	}
-	if stop := evaluateOverload(rules, authID, now); stop > 0 {
-		applyOverload(authID, stop)
+	if stop, reason := evaluateOverload(rules, authID, now); stop > 0 {
+		applyOverload(authID, stop, reason)
 	}
 }
 
-// evaluateOverload returns the longest stop_seconds among triggered rules, or 0.
-func evaluateOverload(rules []OverloadRule, authID string, now time.Time) int {
+// evaluateOverload returns the longest stop_seconds among triggered rules (or 0)
+// plus a human-readable reason describing the winning rule.
+func evaluateOverload(rules []OverloadRule, authID string, now time.Time) (int, string) {
 	var maxWindow int64
 	for _, r := range rules {
 		if r.WindowSeconds > maxWindow {
@@ -67,7 +70,7 @@ func evaluateOverload(rules []OverloadRule, authID string, now time.Time) int {
 		}
 	}
 	if maxWindow <= 0 {
-		return 0
+		return 0, ""
 	}
 	cutoffAll := now.Add(-time.Duration(maxWindow) * time.Second)
 
@@ -76,8 +79,14 @@ func evaluateOverload(rules []OverloadRule, authID string, now time.Time) int {
 
 	tokenEvents[authID] = pruneToken(tokenEvents[authID], cutoffAll)
 	quotaEvents[authID] = pruneQuota(quotaEvents[authID], cutoffAll)
+	sort.Slice(quotaEvents[authID], func(i, j int) bool {
+		return quotaEvents[authID][i].At.Before(quotaEvents[authID][j].At)
+	})
 
 	stop := 0
+	reason := ""
+	triggeredToken := false
+	triggeredQuota := false
 	for _, r := range rules {
 		if r.WindowSeconds <= 0 || r.StopSeconds <= 0 {
 			continue
@@ -96,37 +105,73 @@ func evaluateOverload(rules []OverloadRule, authID string, now time.Time) int {
 		case "quota_percent":
 			triggered = quotaDropExceeds(quotaEvents[authID], cutoff, r.Limit)
 		}
-		if triggered && r.StopSeconds > stop {
+		if !triggered {
+			continue
+		}
+		if r.Metric == "token" {
+			triggeredToken = true
+		}
+		if r.Metric == "quota_percent" {
+			triggeredQuota = true
+		}
+		if r.StopSeconds > stop {
 			stop = r.StopSeconds
+			if r.Metric == "token" {
+				reason = fmt.Sprintf("令牌窗口超限（%d秒内 > %.0f tokens）", r.WindowSeconds, r.Limit)
+			} else {
+				reason = fmt.Sprintf("额度窗口超限（%d秒内下降 > %.1f%%）", r.WindowSeconds, r.Limit)
+			}
 		}
 	}
 	if stop > 0 {
-		delete(tokenEvents, authID)
-		delete(quotaEvents, authID)
+		// Only clear the metric stream(s) that actually triggered, so a quota
+		// trigger never wipes token history (and vice versa).
+		if triggeredToken {
+			delete(tokenEvents, authID)
+		}
+		if triggeredQuota {
+			delete(quotaEvents, authID)
+		}
 	}
-	return stop
+	return stop, reason
 }
 
+// quotaDropExceeds reports whether the account consumed more than limit
+// percentage points within the window. It sums consecutive decreases and
+// re-anchors whenever remaining percent rises (a quota reset), so a window
+// reset or a transient zero observation cannot inflate the measured drop.
 func quotaDropExceeds(evs []quotaEvent, cutoff time.Time, limit float64) bool {
-	var maxP, minP float64
-	first := true
+	var drop, prev float64
+	havePrev := false
 	for _, e := range evs {
 		if !e.At.After(cutoff) {
 			continue
 		}
-		if first {
-			maxP, minP = e.RemainingPercent, e.RemainingPercent
-			first = false
+		// A non-positive remaining percent is treated as "no evidence" (the
+		// host may report a pseudo zero before the first real snapshot). It
+		// re-anchors the measurement instead of counting as an instant 100%
+		// drop, so light usage does not falsely trip the rule.
+		if e.RemainingPercent <= 0 {
+			drop = 0
+			havePrev = false
 			continue
 		}
-		if e.RemainingPercent > maxP {
-			maxP = e.RemainingPercent
+		if !havePrev {
+			prev = e.RemainingPercent
+			havePrev = true
+			continue
 		}
-		if e.RemainingPercent < minP {
-			minP = e.RemainingPercent
+		if e.RemainingPercent < prev {
+			drop += prev - e.RemainingPercent
+		} else {
+			drop = 0
+		}
+		prev = e.RemainingPercent
+		if drop > limit {
+			return true
 		}
 	}
-	return !first && (maxP-minP) > limit
+	return false
 }
 
 func pruneToken(evs []tokenEvent, cutoff time.Time) []tokenEvent {
